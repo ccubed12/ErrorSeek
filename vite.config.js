@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite';
+import { defineConfig, loadEnv } from 'vite';
 
 const searchAngles = [
   { name: 'Foundations', query: (skill, level) => `${skill} ${physicsFoundationTerms(skill)} ${level} learning prerequisites core concepts curriculum` },
@@ -128,8 +128,85 @@ async function researchSkill(skill, level) {
   };
 }
 
-function learningPathApi() {
+function learningPathApi(env) {
   const registerMiddleware = (server) => {
+    const sendJson = (response, status, body) => {
+      response.statusCode = status;
+      response.setHeader('Content-Type', 'application/json');
+      response.end(JSON.stringify(body));
+    };
+    const readBody = async (request) => {
+      let rawBody = '';
+      for await (const chunk of request) {
+        rawBody += chunk;
+        if (rawBody.length > 10_000) throw new Error('Request is too large.');
+      }
+      return JSON.parse(rawBody);
+    };
+    const stripePrices = {
+      monthly: env.STRIPE_PLUS_MONTHLY_PRICE_ID,
+      annual: env.STRIPE_PLUS_ANNUAL_PRICE_ID,
+    };
+    const stripeConfigured = Boolean(env.STRIPE_SECRET_KEY && stripePrices.monthly && stripePrices.annual);
+
+    server.middlewares.use('/api/create-checkout-session', async (request, response) => {
+      if (request.method !== 'POST') return sendJson(response, 405, { error: 'Use POST to start checkout.' });
+      if (!stripeConfigured) return sendJson(response, 503, { error: 'Stripe is not configured. Set STRIPE_SECRET_KEY and both Plus price IDs in the server environment.' });
+      try {
+        const input = await readBody(request);
+        if (!input || !['monthly', 'annual'].includes(input.interval)) {
+          return sendJson(response, 400, { error: 'Choose a valid billing interval.' });
+        }
+        const priceId = stripePrices[input.interval];
+        const protocol = request.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+        const origin = `${protocol}://${request.headers.host || 'localhost:5173'}`;
+        const form = new URLSearchParams({
+          mode: 'subscription',
+          success_url: `${origin}/?checkout_session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${origin}/?checkout_cancelled=1`,
+          'line_items[0][price]': priceId,
+          'line_items[0][quantity]': '1',
+        });
+        const stripeResponse = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: form,
+        });
+        const result = await stripeResponse.json();
+        if (!stripeResponse.ok) throw new Error(result.error?.message || 'Stripe could not create a checkout session.');
+        return sendJson(response, 200, { url: result.url });
+      } catch (error) {
+        return sendJson(response, 502, { error: error.message || 'Could not start Stripe checkout.' });
+      }
+    });
+
+    server.middlewares.use('/api/verify-checkout', async (request, response) => {
+      if (request.method !== 'POST') return sendJson(response, 405, { error: 'Use POST to verify checkout.' });
+      if (!stripeConfigured) return sendJson(response, 503, { error: 'Stripe is not configured on this server.' });
+      try {
+        const input = await readBody(request);
+        if (typeof input.sessionId !== 'string' || !/^cs_(test|live)_[A-Za-z0-9]+$/.test(input.sessionId)) {
+          return sendJson(response, 400, { error: 'Invalid Checkout session.' });
+        }
+        const url = new URL(`https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(input.sessionId)}`);
+        url.searchParams.append('expand[]', 'line_items');
+        const stripeResponse = await fetch(url, {
+          headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` },
+        });
+        const session = await stripeResponse.json();
+        if (!stripeResponse.ok) throw new Error(session.error?.message || 'Stripe could not verify this session.');
+        const hasPlusPrice = session.line_items?.data?.some((item) => Object.values(stripePrices).includes(item.price?.id));
+        const verified = session.status === 'complete' && session.payment_status === 'paid' && hasPlusPrice;
+        if (!verified) return sendJson(response, 402, { verified: false, error: 'This checkout session does not have a completed Plus payment.' });
+        return sendJson(response, 200, { verified: true });
+      } catch (error) {
+        return sendJson(response, 502, { verified: false, error: error.message || 'Could not verify payment.' });
+      }
+    });
+
     server.middlewares.use('/api/generate-path', async (request, response) => {
       response.setHeader('Content-Type', 'application/json');
       if (request.method !== 'POST') {
@@ -194,4 +271,6 @@ function learningPathApi() {
   };
 }
 
-export default defineConfig({ plugins: [learningPathApi()] });
+export default defineConfig(({ mode }) => ({
+  plugins: [learningPathApi(loadEnv(mode, process.cwd(), ''))],
+}));
