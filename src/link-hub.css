@@ -1,0 +1,254 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+
+:root {
+  font-family: 'DM Sans', sans-serif;
+  color: #202b24;
+  background: #f5f6ef;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --ink: #202b24;
+  --muted: #737d74;
+  --line: #e4e8df;
+  --paper: #fff;
+  --forest: #17392d;
+  --leaf: #b8df65;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background:
+    radial-gradient(ellipse at 94% 4%, rgba(184, 223, 101, .17), transparent 26rem),
+    #f5f6ef;
+}
+
+a {
+  color: inherit;
+}
+
+.page {
+  width: min(100% - 48px, 960px);
+  margin: 0 auto;
+}
+
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 88px;
+  border-bottom: 1px solid rgba(32, 43, 36, .1);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--forest);
+  font: 700 19px 'Space Grotesk', sans-serif;
+  text-decoration: none;
+}
+
+.brand-mark {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--leaf);
+  font-size: 16px;
+  transform: rotate(-4deg);
+}
+
+.header-note,
+.site-footer {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.intro {
+  padding: 68px 0 48px;
+}
+
+.eyebrow {
+  margin: 0 0 15px;
+  color: #637b53;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  max-width: 680px;
+  margin-bottom: 14px;
+  font: 600 clamp(42px, 7vw, 68px)/1.04 'Space Grotesk', sans-serif;
+  letter-spacing: -.055em;
+}
+
+h1 span {
+  color: #648044;
+}
+
+.intro-copy {
+  max-width: 480px;
+  margin-bottom: 0;
+  color: #667568;
+  font-size: 16px;
+  line-height: 1.7;
+}
+
+.link-groups {
+  display: grid;
+  gap: 37px;
+}
+
+.link-group {
+  display: grid;
+  grid-template-columns: minmax(170px, .72fr) minmax(0, 1.5fr);
+  gap: 30px;
+  padding-top: 25px;
+  border-top: 1px solid var(--line);
+}
+
+.group-heading h2 {
+  margin-bottom: 8px;
+  font: 600 18px 'Space Grotesk', sans-serif;
+}
+
+.group-heading p {
+  max-width: 240px;
+  margin-bottom: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.link-list {
+  display: grid;
+  gap: 9px;
+}
+
+.link-card {
+  display: flex;
+  min-height: 72px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 17px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .78);
+  text-decoration: none;
+  transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+}
+
+.link-card:hover {
+  transform: translateY(-2px);
+  border-color: #b7c9a6;
+  box-shadow: 0 10px 24px rgba(30, 48, 35, .07);
+}
+
+.link-card:focus-visible,
+.brand:focus-visible,
+.site-footer a:focus-visible {
+  outline: 3px solid #799a53;
+  outline-offset: 3px;
+}
+
+.link-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.link-copy strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.link-copy > span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.link-arrow {
+  flex: 0 0 auto;
+  color: #6a854c;
+  font-size: 18px;
+}
+
+.site-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  margin-top: 54px;
+  padding: 21px 0 30px;
+  border-top: 1px solid var(--line);
+}
+
+.site-footer a {
+  color: var(--forest);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.site-footer a:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+@media (max-width: 640px) {
+  .page {
+    width: min(100% - 36px, 480px);
+  }
+
+  .site-header {
+    min-height: 72px;
+  }
+
+  .header-note {
+    max-width: 150px;
+    text-align: right;
+  }
+
+  .intro {
+    padding: 51px 0 38px;
+  }
+
+  .link-group {
+    grid-template-columns: 1fr;
+    gap: 17px;
+    padding-top: 20px;
+  }
+
+  .group-heading p {
+    max-width: 360px;
+  }
+
+  .site-footer {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 9px;
+    margin-top: 40px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+  }
+}
