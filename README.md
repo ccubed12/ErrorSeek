@@ -21,7 +21,7 @@ Open the local URL printed by Vite. Each path request searches for YouTube video
 
 ## Publish
 
-The website is free to publish on GitHub Pages, and does not require Cloudflare to work. It creates and saves learning paths in the browser, and lesson circles link to YouTube searches when automatic search is not configured. To publish the website, open **Settings → Pages**, choose **GitHub Actions** as the source, and push to `main` (or run **Deploy to GitHub Pages** from **Actions**). It will be available at <https://ccubed12.github.io/ErrorSeek/>.
+The website is free to publish on GitHub Pages, and does not require Cloudflare to work. It creates and saves learning paths in the browser, and lesson circles link to YouTube searches when automatic search is not configured. The repository owner must first open **Settings → Pages** and choose **GitHub Actions** under **Build and deployment → Source**. The workflow cannot enable Pages itself. Once Pages is enabled, push to `main` (or run **Deploy to GitHub Pages** from **Actions**) to publish at <https://ccubed12.github.io/ErrorSeek/>.
 
 Automatic video discovery is an optional, separately hosted free-tier service. To enable it:
 
