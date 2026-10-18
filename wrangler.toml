@@ -1,0 +1,7 @@
+name = "errorseek-api"
+main = "worker/index.js"
+compatibility_date = "2026-10-18"
+workers_dev = true
+
+[vars]
+ALLOWED_ORIGIN = "https://ccubed12.github.io"

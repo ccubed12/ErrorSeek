@@ -1,6 +1,21 @@
 import './styles.css';
+import {
+  getAccountSession,
+  isAccountStorageConfigured,
+  loadAccountState,
+  loadPendingAccountState,
+  saveAccountState,
+  savePendingAccountState,
+  clearPendingAccountState,
+  signIn,
+  signOut,
+  signUp,
+} from './account.js';
 
 const STORAGE_KEY = 'pathwise-learning-state-v1';
+const configuredApiUrl = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
+const API_BASE_URL = configuredApiUrl || (import.meta.env.DEV ? window.location.origin : '');
+const API_GENERATE_PATH_URL = API_BASE_URL ? `${API_BASE_URL}/api/generate-path` : '';
 const defaultState = {
   name: 'Alex Morgan',
   streakDays: [],
@@ -24,26 +39,36 @@ const defaultState = {
   plan: 'free',
 };
 
+let hasSavedLocalState = false;
+
+function normalizeState(saved) {
+  if (saved && saved.reward) {
+    const savedPaths = Array.isArray(saved.paths)
+      ? saved.paths
+      : saved.path && Array.isArray(saved.path.lessons)
+        ? [{ ...saved.path, id: 'path-default' }]
+        : defaultState.paths;
+    const paths = savedPaths.filter((path) => path && Array.isArray(path.lessons)).map((path, index) => ({ ...path, id: path.id || `path-${index + 1}` }));
+    const validPaths = paths.length ? paths : structuredClone(defaultState.paths);
+    const savedState = { ...saved };
+    delete savedState.path;
+    return {
+      ...defaultState,
+      ...savedState,
+      paths: validPaths,
+      activePathId: validPaths.some((path) => path.id === saved.activePathId) ? saved.activePathId : validPaths[0].id,
+      plan: saved.plan === 'plus' ? 'plus' : 'free',
+    };
+  }
+  return structuredClone(defaultState);
+}
+
 function loadState() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    if (saved && saved.reward) {
-      const savedPaths = Array.isArray(saved.paths)
-        ? saved.paths
-        : saved.path && Array.isArray(saved.path.lessons)
-          ? [{ ...saved.path, id: 'path-default' }]
-          : defaultState.paths;
-      const paths = savedPaths.filter((path) => path && Array.isArray(path.lessons)).map((path, index) => ({ ...path, id: path.id || `path-${index + 1}` }));
-      const validPaths = paths.length ? paths : structuredClone(defaultState.paths);
-      const savedState = { ...saved };
-      delete savedState.path;
-      return {
-        ...defaultState,
-        ...savedState,
-        paths: validPaths,
-        activePathId: validPaths.some((path) => path.id === saved.activePathId) ? saved.activePathId : validPaths[0].id,
-        plan: saved.plan === 'plus' ? 'plus' : 'free',
-      };
+    if (saved) {
+      hasSavedLocalState = true;
+      return normalizeState(saved);
     }
   } catch (error) {
     console.warn('Could not read saved learning progress.', error);
@@ -54,16 +79,65 @@ function loadState() {
 let state = loadState();
 let activeView = 'home';
 let toastTimer;
+let authSession = null;
+let authGeneration = 0;
+let accountSaveTimer;
+let accountSaveRevision = 0;
+let accountSaveQueue = Promise.resolve();
+let saveStatus = 'Saved on this device';
 const app = document.querySelector('#app');
 
 function saveState() {
+  let savedLocally = true;
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    return true;
+    hasSavedLocalState = true;
   } catch (error) {
     showToast('Could not save on this device. Check browser storage settings.');
-    return false;
+    savedLocally = false;
   }
+  if (authSession) {
+    const revision = ++accountSaveRevision;
+    try {
+      savePendingAccountState(authSession.user.id, state);
+    } catch (error) {
+      saveStatus = 'Saved on this device';
+      updateSaveStatus();
+      showToast(error.message);
+      return savedLocally;
+    }
+    clearTimeout(accountSaveTimer);
+    saveStatus = 'Saving to your account…';
+    updateSaveStatus();
+    accountSaveTimer = setTimeout(() => {
+      const session = authSession;
+      const snapshot = structuredClone(state);
+      accountSaveQueue = accountSaveQueue.then(async () => {
+        if (authSession?.user.id !== session.user.id || revision !== accountSaveRevision) return;
+        const refreshedSession = await getAccountSession();
+        if (!refreshedSession || authSession?.user.id !== refreshedSession.user.id || revision !== accountSaveRevision) return;
+        authSession = refreshedSession;
+        await saveAccountState(refreshedSession, snapshot);
+        if (authSession?.user.id === refreshedSession.user.id && revision === accountSaveRevision) {
+          clearPendingAccountState(refreshedSession.user.id);
+          saveStatus = 'Synced to your account';
+          updateSaveStatus();
+        }
+      }).catch((error) => {
+        if (authSession?.user.id === session.user.id && revision === accountSaveRevision) {
+          saveStatus = 'Account sync issue';
+          updateSaveStatus();
+          showToast(`Your progress could not be synced: ${error.message}`);
+        }
+      });
+    }, 500);
+  }
+  return savedLocally;
+}
+
+function updateSaveStatus() {
+  const status = document.querySelector('#save-status');
+  if (status) status.textContent = saveStatus;
 }
 
 function safeText(value) {
@@ -78,7 +152,9 @@ async function readJsonResponse(response) {
   const body = await response.text();
   if (!body.trim()) {
     if (response.status === 404) {
-      throw new Error('Video search is not available on this server yet (HTTP 404). Stop the existing app process and start it again with npm run dev.');
+      throw new Error(API_BASE_URL
+        ? 'The video search API endpoint was not found. Check the VITE_API_BASE_URL repository variable and redeploy the website.'
+        : 'Video search is not available on this server yet (HTTP 404). Stop the existing app process and start it again with npm run dev.');
     }
     throw new Error(`The video search service returned an empty response (HTTP ${response.status}). Restart the app and try again.`);
   }
@@ -223,55 +299,28 @@ function render() {
   const longestStreak = getLongestStreak(state.streakDays);
   const today = getDayKey();
   const friends = state.streakCircle?.friends || [];
-  const research = path.research;
-  const sourceById = new Map((research?.sources || []).map((source) => [source.id, source]));
   const rewardProgress = Math.min(progress.done, Number(state.reward.target));
   const rewardPercent = Math.min(100, Math.round(rewardProgress / Math.max(1, Number(state.reward.target)) * 100));
   const date = new Intl.DateTimeFormat('en', { weekday: 'long', month: 'long', day: 'numeric' }).format(new Date());
-  const lessonsMarkup = path.lessons.map((lesson, index) => {
-    const citations = (lesson.sourceIds || []).map((id) => sourceById.get(id)).filter(Boolean);
-    return `
-    <div class="lesson-row">
-      <button class="lesson-check ${lesson.done ? 'complete' : ''}" data-action="toggle-lesson" data-index="${index}" aria-label="${lesson.done ? 'Mark incomplete' : 'Mark complete'}: ${safeText(lesson.title)}">✓</button>
-      <div class="lesson-copy"><strong>${safeText(lesson.title)}</strong><span>${safeText(lesson.detail)}</span>${citations.length ? `<span class="lesson-citations">Resources: ${citations.map((source) => `<a href="${safeText(source.url)}" target="_blank" rel="noopener noreferrer" title="${safeText(source.title)}">${safeText(source.id)}</a>`).join(' ')}</span>` : ''}</div>
-      <div class="lesson-actions"><span class="lesson-time">${lesson.minutes} min</span><button class="video-link" data-action="open-lesson" data-index="${index}" aria-label="Open resource for ${safeText(lesson.title)}">${citations.some((source) => getResourceType(source) === 'article') ? '↗ Open resource' : '▶ Watch video'}</button></div>
-    </div>`;
-  }).join('');
-  const resources = research?.sources || [];
-  const videoCount = resources.filter((source) => getResourceType(source) === 'video').length;
-  const articleCount = resources.length - videoCount;
-  const resourcesMarkup = `
-    <section class="resource-library" aria-label="Learning resources">
-      <div class="library-heading"><div><strong>Your learning library</strong><span>${videoCount} videos · ${articleCount} articles</span></div></div>
-      ${resources.length ? `<div class="research-sources">${resources.map((source) => {
-        const type = getResourceType(source);
-        const exercises = source.exercises || [];
-        const exerciseCount = exercises.filter((exercise) => exercise.done).length;
-        const summary = source.summary || source.snippet || '';
-        const practiceMarkup = state.plan === 'plus' ? `
-          <div class="exercise-block">
-            <div class="exercise-heading"><div><strong>Practice</strong>${exercises.length ? `<span>${exerciseCount}/${exercises.length} done</span>` : ''}</div><button class="text-btn" data-action="toggle-exercise-form" data-id="${safeText(source.id)}" aria-expanded="false" aria-controls="exercise-form-${safeText(source.id)}">＋ Add exercise</button></div>
-            ${exercises.length ? `<ul class="exercise-list">${exercises.map((exercise) => `<li class="exercise-item ${exercise.done ? 'complete' : ''}"><label><input type="checkbox" data-action="toggle-exercise" data-source-id="${safeText(source.id)}" data-exercise-id="${safeText(exercise.id)}" ${exercise.done ? 'checked' : ''} /><span>${safeText(exercise.prompt)}</span></label><button class="remove-exercise" data-action="remove-exercise" data-source-id="${safeText(source.id)}" data-exercise-id="${safeText(exercise.id)}" aria-label="Remove exercise">×</button></li>`).join('')}</ul>` : ''}
-            <form class="exercise-form" id="exercise-form-${safeText(source.id)}" data-source-id="${safeText(source.id)}" hidden><label for="exercise-prompt-${safeText(source.id)}">Exercise</label><div><input id="exercise-prompt-${safeText(source.id)}" name="prompt" maxlength="180" placeholder="e.g. Write down three key ideas" required /><button class="primary-btn" type="submit" aria-label="Save exercise">Add</button></div></form>
-          </div>` : `<div class="exercise-locked"><span aria-hidden="true">✦</span><div><strong>Exercises are a Plus feature</strong><small>Unlock practice tasks for every resource.</small></div><button class="text-btn" data-action="upgrade">Unlock</button></div>`;
-        return `<article class="research-source">
-          <div class="resource-source-meta"><span class="resource-kind">${type === 'video' ? 'VIDEO' : 'ARTICLE'}</span><button class="remove-video" data-action="remove-resource" data-id="${safeText(source.id)}" aria-label="Remove ${safeText(source.title)}">Remove</button></div>
-          ${type === 'video' && source.videoId ? `<iframe src="https://www.youtube-nocookie.com/embed/${safeText(source.videoId)}" title="${safeText(source.title)}" loading="lazy" referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>` : `<div class="article-preview"><span aria-hidden="true">Aa</span><strong>Reading</strong><small>Open this article in a new tab</small></div>`}
-          <strong class="resource-title">${safeText(source.title)}</strong>
-          <div class="resource-summary"><div class="summary-heading"><strong>Summary</strong><button class="text-btn" data-action="toggle-summary-form" data-id="${safeText(source.id)}" aria-expanded="false" aria-controls="summary-form-${safeText(source.id)}">Edit</button></div><p>${summary ? safeText(summary) : 'Add a short summary for this resource.'}</p><form class="summary-form" id="summary-form-${safeText(source.id)}" data-source-id="${safeText(source.id)}" hidden><textarea name="summary" maxlength="1000" rows="3" placeholder="What are the main ideas?">${safeText(summary)}</textarea><button class="primary-btn" type="submit">Save summary</button></form></div>
-          <a href="${safeText(source.url)}" target="_blank" rel="noopener noreferrer">${type === 'video' ? 'Open video' : 'Read article'} ↗</a>
-          ${practiceMarkup}
-        </article>`;
-      }).join('')}</div>` : '<p class="video-empty">Your library is ready. Add a video to watch or an article to read.</p>'}
-      <div class="resource-add-actions"><button class="text-btn" data-action="toggle-resource-form" data-type="video" aria-expanded="false" aria-controls="add-resource-form">＋ Add video</button><button class="text-btn" data-action="toggle-resource-form" data-type="article" aria-expanded="false" aria-controls="add-resource-form">＋ Add article</button></div>
-      <form class="add-video-form" id="add-resource-form" data-type="video" hidden>
-        <div class="field"><label for="resource-title">Title</label><input id="resource-title" name="title" maxlength="100" placeholder="Give this resource a title" required /></div>
-        <div class="field"><label for="resource-url">Link</label><input id="resource-url" name="url" type="url" placeholder="https://youtube.com/watch?v=..." required /></div>
-        <div class="field resource-summary-field"><label for="resource-summary">Summary <span>optional</span></label><textarea id="resource-summary" name="summary" maxlength="1000" rows="3" placeholder="Capture the main ideas"></textarea></div>
-        <button class="primary-btn" type="submit">Add to path <span aria-hidden="true">→</span></button>
-        <p class="video-form-error" id="resource-form-error" role="alert"></p>
-      </form>
-    </section>`;
+  const nextLessonIndex = path.lessons.findIndex((lesson) => !lesson.done);
+  const lessonPathMarkup = path.lessons.map((lesson, index) => `
+    <div class="path-stop ${index % 2 ? 'right' : 'left'}">
+      <button class="path-node ${lesson.done ? 'complete' : ''} ${index === nextLessonIndex ? 'current' : ''}" data-action="open-lesson" data-index="${index}" aria-haspopup="dialog" aria-label="Open lesson ${index + 1}: ${safeText(lesson.title)}">
+        <span class="path-node-circle">${lesson.done ? '✓' : index + 1}</span>
+        <span class="path-node-title">${safeText(lesson.title)}</span>
+        <span class="path-node-meta">${lesson.minutes} min${lesson.done ? ' · complete' : index === nextLessonIndex ? ' · start here' : ''}</span>
+      </button>
+    </div>`).join('');
+  const trailCommands = path.lessons.slice(0, -1).map((_, index) => {
+    const startX = index % 2 ? 75 : 25;
+    const endX = index % 2 ? 25 : 75;
+    const startY = 62 + index * 124;
+    const endY = startY + 124;
+    return `M ${startX} ${startY} C ${startX} ${startY + 52}, ${endX} ${endY - 52}, ${endX} ${endY}`;
+  }).join(' ');
+  const lessonPathTrail = trailCommands
+    ? `<svg class="path-trail" viewBox="0 0 100 ${path.lessons.length * 124}" preserveAspectRatio="none" aria-hidden="true"><path d="${trailCommands}" /></svg>`
+    : '';
   const friendsMarkup = friends.length ? friends.map((friend) => {
     const checkedIn = (friend.days || []).includes(today);
     return `<div class="friend-row"><span class="friend-avatar">${safeText(friend.name.slice(0, 1).toUpperCase())}</span><div class="friend-copy"><strong>${safeText(friend.name)}</strong><span>${getCurrentStreak(friend.days)} day streak</span></div><button class="friend-checkin ${checkedIn ? 'checked-in' : ''}" data-action="toggle-friend-checkin" data-id="${safeText(friend.id)}">${checkedIn ? '✓ Today' : 'Check in'}</button><button class="remove-friend" data-action="remove-friend" data-id="${safeText(friend.id)}" aria-label="Remove ${safeText(friend.name)}">×</button></div>`;
@@ -311,8 +360,15 @@ function render() {
     <div class="learning-stack">
       <section class="panel path-panel" id="path-panel">
         <div class="progress-row"><div class="progress-meta"><span><strong>${progress.done} of ${progress.total}</strong> lessons complete</span><strong>${progress.percent}%</strong></div><div class="track" role="progressbar" aria-label="Learning path progress" aria-valuenow="${progress.percent}" aria-valuemin="0" aria-valuemax="100"><div class="track-fill" style="width:${progress.percent}%"></div></div></div>
-        ${resourcesMarkup}
-        <div class="lesson-list">${lessonsMarkup}</div>
+        <div class="path-heading"><div><strong>Your learning journey</strong><span>Choose a circle to open its notes and video.</span></div><div class="path-resource-actions"><button class="text-btn" data-action="toggle-resource-form" data-type="video" aria-expanded="false" aria-controls="add-resource-form">＋ Add video</button><button class="text-btn" data-action="toggle-resource-form" data-type="article" aria-expanded="false" aria-controls="add-resource-form">＋ Add article</button></div></div>
+        <form class="add-video-form path-resource-form" id="add-resource-form" data-type="video" hidden>
+          <div class="field"><label for="resource-title">Title</label><input id="resource-title" name="title" maxlength="100" placeholder="Give this resource a title" required /></div>
+          <div class="field"><label for="resource-url">Link</label><input id="resource-url" name="url" type="url" placeholder="https://youtube.com/watch?v=..." required /></div>
+          <div class="field resource-summary-field"><label for="resource-summary">Summary <span>optional</span></label><textarea id="resource-summary" name="summary" maxlength="1000" rows="3" placeholder="Capture the main ideas"></textarea></div>
+          <button class="primary-btn" type="submit">Add to path <span aria-hidden="true">→</span></button>
+          <p class="video-form-error" id="resource-form-error" role="alert"></p>
+        </form>
+        <div class="lesson-path" aria-label="Lessons in your learning path">${lessonPathTrail}${lessonPathMarkup}</div>
       </section>
       <section class="reward-strip"><div class="reward-icon">✦</div><div class="reward-strip-copy"><span class="eyebrow">Reward goal</span><strong>${safeText(state.reward.title)}</strong><div class="reward-strip-progress"><span>${rewardProgress} of ${state.reward.target} milestones</span><div class="track"><div class="track-fill" style="width:${rewardPercent}%;background:#e99a78"></div></div></div></div><button class="goal-edit" data-action="edit-reward">Edit</button></section>
     </div>`;
@@ -332,10 +388,10 @@ function render() {
         <button class="new-path-btn" data-action="build-path"><span>＋</span> New path</button>
         <div class="plan-card"><span>${state.plan === 'plus' ? 'PLUS PLAN' : 'FREE PLAN'}</span><p>${state.plan === 'plus' ? `${state.paths.length} paths saved` : `${state.paths.length} of 1 path used`}</p>${state.plan === 'plus' ? '' : '<button data-action="upgrade">Unlock multiple paths</button>'}</div>
         <div class="side-spacer"></div>
-        <div class="profile"><div class="avatar">${safeText(firstName.slice(0, 1))}${safeText(state.name.split(' ')[1]?.slice(0, 1) || '')}</div><div class="profile-copy"><strong>${safeText(state.name)}</strong><span>Local profile</span></div></div>
+        <div class="profile"><div class="avatar">${safeText(firstName.slice(0, 1))}${safeText(state.name.split(' ')[1]?.slice(0, 1) || '')}</div><div class="profile-copy"><strong>${safeText(state.name)}</strong><span>${authSession ? 'Account profile' : 'Device-only profile'}</span></div></div>
       </aside>
       <main class="main">
-        <header class="topbar"><span class="date-label">${date}</span><span class="saved-pill">Saved on this device</span></header>
+        <header class="topbar"><span class="date-label">${date}</span><div class="top-actions"><span class="saved-pill" id="save-status">${safeText(saveStatus)}</span><button class="account-button" data-action="account">${authSession ? safeText(authSession.user.email || 'Your account') : 'Sign in / create account'}</button></div></header>
         ${activeView === 'home' ? homeMarkup : activeView === 'create' ? createMarkup : learningMarkup}
       </main>
     </div>
@@ -349,6 +405,136 @@ function showToast(message) {
   toast.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toast.classList.remove('show'), 2600);
+}
+
+function openAccountModal(mode = 'signin') {
+  const root = document.querySelector('#modal-root');
+  if (authSession) {
+    root.innerHTML = `<div class="modal-backdrop" data-action="backdrop"><section class="modal account-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-head"><div><h2 id="modal-title">Your account</h2><p>Your learning progress is saved to this account.</p></div><button class="close-btn" data-action="close-modal" aria-label="Close">×</button></div><p class="account-email">${safeText(authSession.user.email || '')}</p><div class="modal-actions"><button type="button" class="secondary-btn" data-action="close-modal">Close</button><button type="button" class="primary-btn" data-action="sign-out">Sign out</button></div></section></div>`;
+    return;
+  }
+  if (!isAccountStorageConfigured()) {
+    root.innerHTML = `<div class="modal-backdrop" data-action="backdrop"><section class="modal account-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-head"><div><h2 id="modal-title">Sync your learning</h2><p>Your progress is currently saved in this browser only.</p></div><button class="close-btn" data-action="close-modal" aria-label="Close">×</button></div><div class="setup-note"><strong>Connect a Supabase project to enable accounts.</strong><ol><li>Create a free Supabase project and run <code>supabase/schema.sql</code> in its SQL Editor.</li><li>Copy <code>.env.example</code> to <code>.env</code> and add your project URL and publishable anon key.</li><li>Restart the app. Then you can create an account and sync progress across devices.</li></ol></div><div class="modal-actions"><button type="button" class="primary-btn" data-action="close-modal">Continue on this device</button></div></section></div>`;
+    return;
+  }
+  const isSignUp = mode === 'signup';
+  root.innerHTML = `<div class="modal-backdrop" data-action="backdrop"><section class="modal account-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-head"><div><h2 id="modal-title">${isSignUp ? 'Create your account' : 'Welcome back'}</h2><p>${isSignUp ? 'Your paths and progress will follow you across devices.' : 'Sign in to pick up where you left off.'}</p></div><button class="close-btn" data-action="close-modal" aria-label="Close">×</button></div><form id="account-form" data-mode="${mode}"><div class="modal-fields">${isSignUp ? '<div class="field"><label for="account-name">Your name</label><input id="account-name" name="name" autocomplete="name" maxlength="60" required /></div>' : ''}<div class="field"><label for="account-email">Email</label><input id="account-email" name="email" type="email" autocomplete="email" required /></div><div class="field"><label for="account-password">Password</label><input id="account-password" name="password" type="password" autocomplete="${isSignUp ? 'new-password' : 'current-password'}" minlength="8" required /></div></div><p class="account-form-error" id="account-form-error" role="alert"></p><div class="modal-actions"><button type="button" class="text-btn" data-action="switch-account-mode" data-mode="${isSignUp ? 'signin' : 'signup'}">${isSignUp ? 'Already have an account? Sign in' : 'New to Pathwise? Create an account'}</button><button type="submit" class="primary-btn">${isSignUp ? 'Create account' : 'Sign in'}</button></div></form></section></div>`;
+}
+
+async function initializeAccount() {
+  if (!isAccountStorageConfigured()) return;
+  const initialGeneration = authGeneration;
+  let generation = initialGeneration;
+  try {
+    const session = await getAccountSession();
+    if (authGeneration !== initialGeneration) return;
+    if (!session) return;
+    authSession = session;
+    generation = ++authGeneration;
+    const saveRevision = accountSaveRevision;
+    const pendingState = loadPendingAccountState(session.user.id);
+    const savedState = pendingState || await loadAccountState(session);
+    if (authGeneration !== generation || authSession?.user.id !== session.user.id) return;
+    if (accountSaveRevision !== saveRevision) {
+      saveState();
+      render();
+      return;
+    }
+    if (savedState) {
+      state = normalizeState(savedState);
+      if (pendingState) {
+        saveState();
+      } else {
+        saveStatus = 'Synced to your account';
+      }
+    } else {
+      state = structuredClone(defaultState);
+      state.name = session.user.user_metadata?.display_name || session.user.email?.split('@')[0] || state.name;
+      saveState();
+    }
+    render();
+  } catch (error) {
+    if (authGeneration !== generation) return;
+    authSession = null;
+    saveStatus = 'Saved on this device';
+    render();
+    showToast(`Could not load your account: ${error.message}`);
+  }
+}
+
+async function submitAccountForm(form) {
+  const formData = new FormData(form);
+  const mode = form.dataset.mode;
+  const email = String(formData.get('email') || '').trim();
+  const password = String(formData.get('password') || '');
+  const name = String(formData.get('name') || '').trim();
+  const submitButton = form.querySelector('button[type="submit"]');
+  const errorMessage = document.querySelector('#account-form-error');
+  submitButton.disabled = true;
+  submitButton.textContent = mode === 'signup' ? 'Creating account…' : 'Signing in…';
+  errorMessage.textContent = '';
+  try {
+    let session;
+    if (mode === 'signup') {
+      const result = await signUp(email, password, name);
+      if (result.requiresEmailConfirmation) {
+        openAccountModal('signin');
+        showToast('Check your email to confirm your account, then sign in.');
+        return;
+      }
+      session = result.session;
+      if (hasSavedLocalState) {
+        state = normalizeState(state);
+      } else {
+        state = structuredClone(defaultState);
+      }
+      state.name = name;
+    } else {
+      session = await signIn(email, password);
+      const pendingState = loadPendingAccountState(session.user.id);
+      const savedState = pendingState || await loadAccountState(session);
+      if (savedState) {
+        state = normalizeState(savedState);
+      } else {
+        state = structuredClone(defaultState);
+        state.name = session.user.user_metadata?.display_name || email.split('@')[0] || state.name;
+      }
+    }
+    authSession = session;
+    authGeneration += 1;
+    saveStatus = 'Saving to your account…';
+    saveState();
+    document.querySelector('#modal-root').innerHTML = '';
+    render();
+    showToast(mode === 'signup' ? 'Account created. Your learning is now synced.' : 'Welcome back. Your learning is synced.');
+  } catch (error) {
+    submitButton.disabled = false;
+    submitButton.textContent = mode === 'signup' ? 'Create account' : 'Sign in';
+    errorMessage.textContent = error.message;
+  }
+}
+
+async function handleSignOut() {
+  const session = authSession;
+  try {
+    await signOut(session);
+  } catch (error) {
+    showToast(`Signed out on this device, but the server sign-out failed: ${error.message}`);
+  }
+  authSession = null;
+  authGeneration += 1;
+  accountSaveRevision += 1;
+  clearTimeout(accountSaveTimer);
+  state = structuredClone(defaultState);
+  hasSavedLocalState = false;
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch (error) {
+    console.warn('Could not clear local learning progress after sign-out.', error);
+  }
+  saveStatus = 'Saved on this device';
+  render();
+  showToast('You have signed out.');
 }
 
 async function completeCheckoutReturn() {
@@ -433,6 +619,47 @@ function openModal(type) {
   });
 }
 
+function openLessonModal(index) {
+  const path = getActivePath();
+  const lesson = path.lessons[index];
+  if (!lesson) return;
+
+  const sourceById = new Map((path.research?.sources || []).map((source) => [source.id, source]));
+  const sources = (lesson.sourceIds || []).map((id) => sourceById.get(id)).filter(Boolean);
+  const videos = sources.filter((source) => getResourceType(source) === 'video');
+  const summary = lesson.summary || lesson.detail || 'Use this lesson to build your skills one step at a time.';
+  const resourcesMarkup = sources.map((source) => {
+    const type = getResourceType(source);
+    const sourceSummary = source.summary || source.snippet || '';
+    const exercises = source.exercises || [];
+    const exerciseCount = exercises.filter((exercise) => exercise.done).length;
+    const practiceMarkup = state.plan === 'plus' ? `
+      <div class="exercise-block">
+        <div class="exercise-heading"><div><strong>Practice</strong>${exercises.length ? `<span>${exerciseCount}/${exercises.length} done</span>` : ''}</div><button class="text-btn" data-action="toggle-exercise-form" data-id="${safeText(source.id)}" aria-expanded="false" aria-controls="exercise-form-${safeText(source.id)}">＋ Add exercise</button></div>
+        ${exercises.length ? `<ul class="exercise-list">${exercises.map((exercise) => `<li class="exercise-item ${exercise.done ? 'complete' : ''}"><label><input type="checkbox" data-action="toggle-exercise" data-source-id="${safeText(source.id)}" data-exercise-id="${safeText(exercise.id)}" ${exercise.done ? 'checked' : ''} /><span>${safeText(exercise.prompt)}</span></label><button class="remove-exercise" data-action="remove-exercise" data-source-id="${safeText(source.id)}" data-exercise-id="${safeText(exercise.id)}" aria-label="Remove exercise">×</button></li>`).join('')}</ul>` : ''}
+        <form class="exercise-form" id="exercise-form-${safeText(source.id)}" data-source-id="${safeText(source.id)}" hidden><label for="exercise-prompt-${safeText(source.id)}">Exercise</label><div><input id="exercise-prompt-${safeText(source.id)}" name="prompt" maxlength="180" placeholder="e.g. Write down three key ideas" required /><button class="primary-btn" type="submit" aria-label="Save exercise">Add</button></div></form>
+      </div>` : `<div class="exercise-locked"><span aria-hidden="true">✦</span><div><strong>Exercises are a Plus feature</strong><small>Unlock practice tasks for every resource.</small></div><button class="text-btn" data-action="upgrade">Unlock</button></div>`;
+    return `<article class="lesson-resource">
+      <div class="resource-source-meta"><span class="resource-kind">${type === 'video' ? 'VIDEO' : 'ARTICLE'}</span><button class="remove-video" data-action="remove-resource" data-id="${safeText(source.id)}" aria-label="Remove ${safeText(source.title)}">Remove</button></div>
+      ${type === 'video' && source.videoId ? `<iframe src="https://www.youtube-nocookie.com/embed/${safeText(source.videoId)}" title="${safeText(source.title)}" loading="lazy" referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>` : type === 'article' ? '<div class="article-preview"><span aria-hidden="true">Aa</span><strong>Reading</strong><small>Open this article in a new tab</small></div>' : ''}
+      <strong class="resource-title">${safeText(source.title)}</strong>
+      <div class="resource-summary"><div class="summary-heading"><strong>Summary</strong><button class="text-btn" data-action="toggle-summary-form" data-id="${safeText(source.id)}" aria-expanded="false" aria-controls="summary-form-${safeText(source.id)}">Edit</button></div><p>${sourceSummary ? safeText(sourceSummary) : 'Add a short summary for this resource.'}</p><form class="summary-form" id="summary-form-${safeText(source.id)}" data-source-id="${safeText(source.id)}" hidden><textarea name="summary" maxlength="1000" rows="3" placeholder="What are the main ideas?">${safeText(sourceSummary)}</textarea><button class="primary-btn" type="submit">Save summary</button></form></div>
+      <a href="${safeText(source.url)}" target="_blank" rel="noopener noreferrer">${type === 'video' ? 'Open video' : 'Read article'} ↗</a>
+      ${practiceMarkup}
+    </article>`;
+  }).join('');
+  const root = document.querySelector('#modal-root');
+  root.innerHTML = `<div class="modal-backdrop"><section class="modal lesson-modal" role="dialog" aria-modal="true" aria-labelledby="lesson-modal-title">
+    <div class="modal-head"><div><span class="eyebrow">Lesson ${index + 1} · ${lesson.minutes} min</span><h2 id="lesson-modal-title">${safeText(lesson.title)}</h2></div><button class="close-btn" data-action="close-modal" aria-label="Close lesson">×</button></div>
+    <section class="lesson-notes"><h3>Summary</h3><p>${safeText(summary)}</p></section>
+    ${videos.length ? `<section class="lesson-modal-resources" aria-label="Lesson videos">${resourcesMarkup}</section>` : sources.length ? `<section class="lesson-modal-resources" aria-label="Lesson resources">${resourcesMarkup}<button class="video-link" data-action="youtube" data-index="${index}">Find a video on YouTube ↗</button></section>` : `<div class="lesson-video-empty"><p>No video is linked to this lesson yet.</p><button class="video-link" data-action="youtube" data-index="${index}">Find a video on YouTube ↗</button></div>`}
+    <div class="modal-actions"><button class="secondary-btn" data-action="close-modal">Close</button><button class="primary-btn" data-action="toggle-lesson" data-index="${index}">${lesson.done ? 'Mark as not done' : 'Complete lesson ✓'}</button></div>
+  </section></div>`;
+  root.querySelector('.modal-backdrop').addEventListener('click', (event) => {
+    if (event.target.classList.contains('modal-backdrop')) root.innerHTML = '';
+  });
+}
+
 function searchYouTube(index) {
   const path = getActivePath();
   const lesson = path.lessons[index];
@@ -452,7 +679,13 @@ app.addEventListener('click', (event) => {
   const target = event.target.closest('[data-action]');
   if (!target) return;
   const { action } = target.dataset;
-  if (action === 'toggle-lesson') {
+  if (action === 'account') {
+    openAccountModal();
+  } else if (action === 'switch-account-mode') {
+    openAccountModal(target.dataset.mode);
+  } else if (action === 'sign-out') {
+    handleSignOut();
+  } else if (action === 'toggle-lesson') {
     const path = getActivePath();
     const index = Number(target.dataset.index);
     path.lessons[index].done = !path.lessons[index].done;
@@ -481,12 +714,7 @@ app.addEventListener('click', (event) => {
   } else if (action === 'youtube') {
     searchYouTube(Number(target.dataset.index));
   } else if (action === 'open-lesson') {
-    const path = getActivePath();
-    const lesson = path.lessons[Number(target.dataset.index)];
-    const sourceById = new Map((path.research?.sources || []).map((source) => [source.id, source]));
-    const source = (lesson?.sourceIds || []).map((id) => sourceById.get(id)).find(Boolean);
-    if (source) window.open(source.url, '_blank', 'noopener,noreferrer');
-    else searchYouTube(Number(target.dataset.index));
+    openLessonModal(Number(target.dataset.index));
   } else if (action === 'nav-home') {
     activeView = 'home';
     render();
@@ -590,7 +818,9 @@ app.addEventListener('change', (event) => {
 
 app.addEventListener('submit', async (event) => {
   event.preventDefault();
-  if (event.target.id === 'checkout-form') {
+  if (event.target.id === 'account-form') {
+    await submitAccountForm(event.target);
+  } else if (event.target.id === 'checkout-form') {
     const submitButton = event.target.querySelector('button[type="submit"]');
     submitButton.disabled = true;
     submitButton.textContent = 'Connecting to Stripe...';
@@ -627,20 +857,25 @@ app.addEventListener('submit', async (event) => {
     let completionMessage = `Your ${skill} path is ready.`;
     const starterPath = makePath(skill, level, weeklyHours);
     try {
-      const response = await fetch('/api/generate-path', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ skill, level, weeklyHours }),
-      });
-      const result = await readJsonResponse(response);
-      if (!response.ok) throw new Error(result.error || 'Could not find videos for that subject.');
-      if (!result.research?.sources?.length || !Array.isArray(result.lessons) || !result.lessons.length) {
-        throw new Error('The search did not return any matching YouTube videos. Try a more specific topic.');
-      }
       const pathId = crypto.randomUUID();
-      state.paths.push({ ...starterPath, id: pathId, lessons: result.lessons, research: result.research });
+      if (API_GENERATE_PATH_URL) {
+        const response = await fetch(API_GENERATE_PATH_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ skill, level, weeklyHours }),
+        });
+        const result = await readJsonResponse(response);
+        if (!response.ok) throw new Error(result.error || 'Could not find videos for that subject.');
+        if (!result.research?.sources?.length || !Array.isArray(result.lessons) || !result.lessons.length) {
+          throw new Error('The search did not return any matching YouTube videos. Try a more specific topic.');
+        }
+        state.paths.push({ ...starterPath, id: pathId, lessons: result.lessons, research: result.research });
+        completionMessage = `Found ${result.research.sources.length} YouTube videos for your path.`;
+      } else {
+        state.paths.push({ ...starterPath, id: pathId });
+        completionMessage = 'Your learning path is ready. Open a lesson circle to search YouTube, or add your own video.';
+      }
       state.activePathId = pathId;
-      completionMessage = `Found ${result.research.sources.length} YouTube videos for your path.`;
     } catch (error) {
       submitButton.disabled = false;
       submitButton.textContent = 'Find my videos →';
@@ -718,4 +953,5 @@ app.addEventListener('submit', async (event) => {
 });
 
 render();
+initializeAccount();
 completeCheckoutReturn();
